@@ -6,6 +6,13 @@ defaults:
   - training: default
   - wandb: default
   - _self_
+
+# Model size reduction for profiling (avoid OOM)
+# Uncomment to override model defaults:
+# model:
+#   kwargs:
+#     hidden_dim: 64        # Reduce from 128 to 64 (saves ~75% params)
+#     num_layers: 4         # Reduce from 8 to 4 (saves ~50% params)
   
 
 # output_dir must be an absolute path (so that launch scripts are fully descriptive)
@@ -16,6 +23,15 @@ overwrite: false
 return_adatas: false
 pred_adata_path: null
 true_adata_path: null
+
+# Profiling configuration
+# WARNING: Profiling adds ~10-20% memory overhead. Reduce active_steps if OOM occurs.
+# Set wait_steps=0, warmup_steps=0, active_steps=1 to only profile the first step
+profiling:
+  enabled: false
+  wait_steps: 0        # Start immediately (no waiting)
+  warmup_steps: 0      # No warmup (start recording immediately)
+  active_steps: 1      # Only record 1 step (step 0)
 
 # don't save hydra output
 hydra:

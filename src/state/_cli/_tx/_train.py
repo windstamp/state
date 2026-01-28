@@ -16,6 +16,7 @@ def run_tx_train(cfg: DictConfig):
     import os
     import pickle
     import shutil
+    import sys
     from os.path import exists, join
     from pathlib import Path
 
@@ -179,10 +180,44 @@ def run_tx_train(cfg: DictConfig):
         cfg["training"],
         data_module.get_var_dims(),
     )
+    # print(f'model: {model}')
 
     print(
         f"Model created. Estimated params size: {sum(p.numel() * p.element_size() for p in model.parameters()) / 1024**3:.2f} GB"
     )
+    
+    # Setup profiling if enabled
+    enable_profiling = cfg.get("profiling", {}).get("enabled", False)
+    hook_dict = {}
+    hooks = []
+    prof = None
+    
+    if enable_profiling:
+        profiling_dir = join(run_output_dir, "profiling")
+        os.makedirs(profiling_dir, exist_ok=True)
+        
+        # Import profile_utils
+        profile_utils_path = Path(__file__).parent.parent.parent.parent.parent
+        sys.path.insert(0, str(profile_utils_path))
+        try:
+            from profile_utils import register_hooks
+            hooks = register_hooks(model, hook_dict)
+            print(f"\n{'='*80}")
+            print(f"Profiling Enabled")
+            print(f"{'='*80}")
+            print(f"Registered {len(hooks)} hooks for layer profiling")
+            print(f"Output: {profiling_dir}/")
+            print(f"{'='*80}\n")
+            
+            # Store profiling info on model for callback access
+            model._profiler_enabled = True
+            model._profiler_hook_dict = hook_dict
+            model._profiling_dir = profiling_dir
+            model._profiler_info = {}  # Initialize dictionary for storing profiler object
+        except ImportError as e:
+            print(f"Warning: Could not import profile_utils: {e}")
+            print("Profiling disabled.")
+            enable_profiling = False
     loggers = get_loggers(
         output_dir=cfg["output_dir"],
         name=cfg["name"],
@@ -394,6 +429,97 @@ def run_tx_train(cfg: DictConfig):
         print("trainer.fit() completed with manual checkpoint")
     else:
         print(f"About to call trainer.fit() with checkpoint_path={checkpoint_path}")
+        
+        print(f"Model device: {next(model.parameters()).device}")
+        print(f"CUDA memory allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+        print(f"CUDA memory reserved: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
+
+        # Start PyTorch profiler if enabled
+        if enable_profiling:
+            from torch.profiler import profile, ProfilerActivity, schedule
+            
+            prof_config = cfg.get("profiling", {})
+            wait_steps = prof_config.get("wait_steps", 1)
+            warmup_steps = prof_config.get("warmup_steps", 1)
+            active_steps = prof_config.get("active_steps", 3)
+            
+            profiling_dir = join(run_output_dir, "profiling")
+            
+            # Define trace handler to save immediately when profiling completes
+            def trace_handler(p):
+                trace_file = join(profiling_dir, "trace.json")
+                try:
+                    p.export_chrome_trace(trace_file)
+                    print(f"\n{'='*80}")
+                    print(f"Profiling trace auto-saved to: {trace_file}")
+                    print(f"{'='*80}\n")
+                except Exception as e:
+                    print(f"Warning: Could not save trace: {e}")
+                
+                # Also save layer shapes immediately
+                if hook_dict:
+                    hooks_file = join(profiling_dir, "layer_shapes.json")
+                    try:
+                        import json
+                        with open(hooks_file, 'w') as f:
+                            json.dump(hook_dict, f, indent=2, default=str)
+                        print(f"Layer shapes auto-saved to: {hooks_file}\n")
+                    except Exception as e:
+                        print(f"Warning: Could not save layer shapes: {e}")
+            
+            prof_schedule = schedule(
+                wait=wait_steps,
+                warmup=warmup_steps,
+                active=active_steps,
+                repeat=1
+            )
+            
+            activities = [ProfilerActivity.CPU]
+            if torch.cuda.is_available():
+                activities.append(ProfilerActivity.CUDA)
+            
+            prof = profile(
+                activities=activities,
+                schedule=prof_schedule,
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=True,
+                on_trace_ready=trace_handler  # Save immediately when ready
+            )
+            prof.start()
+            print("PyTorch profiler started (auto-save enabled)\n")
+            
+            # Store profiler reference on model
+            model._profiler = prof
+            
+            # Add callback to step profiler after each batch
+            from lightning.pytorch.callbacks import Callback
+            class ProfilerStepCallback(Callback):
+                def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+                    if hasattr(pl_module, '_profiler') and pl_module._profiler:
+                        pl_module._profiler.step()
+                        # Print confirmation on first batch
+                        if batch_idx == 0:
+                            print(f"[Profiler] step() called for batch {batch_idx}")
+            
+            # Insert at beginning so it runs before other callbacks
+            trainer.callbacks.insert(0, ProfilerStepCallback())
+            
+            # Store profiler on model for callback access
+            model._profiler_info["prof"] = prof
+            
+            # Add callback to step profiler
+            from lightning.pytorch.callbacks import Callback
+            class ProfilerStepCallback(Callback):
+                def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+                    if hasattr(pl_module, '_profiler_info') and pl_module._profiler_info.get('prof'):
+                        pl_module._profiler_info['prof'].step()
+                        if batch_idx == 0:
+                            print(f"Profiler step called for batch {batch_idx}")
+            
+            trainer.callbacks.append(ProfilerStepCallback())
+
+        logger.info("Starting trainer fit.")
         # Train
         trainer.fit(
             model,
@@ -403,6 +529,69 @@ def run_tx_train(cfg: DictConfig):
         print("trainer.fit() completed")
 
     print("Training completed, saving final checkpoint...")
+    
+    # Stop profiler and check if results were saved by callback
+    if enable_profiling and prof is not None:
+        prof.stop()
+        
+        profiling_dir = join(run_output_dir, "profiling")
+        trace_file = join(profiling_dir, "trace.json")
+        hooks_file = join(profiling_dir, "layer_shapes.json")
+        
+        trace_exists = exists(trace_file)
+        hooks_exist = exists(hooks_file)
+        
+        # Only save if callback didn't already save
+        if not trace_exists:
+            try:
+                prof.export_chrome_trace(trace_file)
+                print(f"Chrome trace saved (fallback): {trace_file}")
+            except Exception as e:
+                print(f"Warning: Could not save Chrome trace: {e}")
+        
+        if hook_dict and not hooks_exist:
+            try:
+                with open(hooks_file, 'w') as f:
+                    json.dump(hook_dict, f, indent=2, default=str)
+                print(f"Layer shapes saved (fallback): {hooks_file}")
+            except Exception as e:
+                print(f"Warning: Could not save layer shapes: {e}")
+        
+        # Print summary of what was saved
+        if trace_exists or hooks_exist:
+            print(f"\n{'='*80}")
+            print(f"Profiling Results (auto-saved during training)")
+            print(f"{'='*80}")
+            if trace_exists:
+                print(f"Chrome trace: {trace_file}")
+            if hooks_exist:
+                print(f"Layer shapes: {hooks_file}")
+        else:
+            print(f"\n{'='*80}")
+            print(f"Profiling Results")
+            print(f"{'='*80}")
+            print(f"Chrome trace: {trace_file}")
+            if hook_dict:
+                print(f"Layer shapes: {hooks_file}")
+        
+        # Print profiler summary
+        try:
+            print(f"\nTop 10 operations by CPU time:")
+            print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=10))
+            
+            if torch.cuda.is_available():
+                print(f"\nTop 10 operations by CUDA time:")
+                print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+        except Exception as e:
+            print(f"Warning: Could not print profiler summary: {e}")
+        
+        print(f"\nView Chrome trace at: chrome://tracing")
+        print(f"Analyze with: python analyze_state_profile.py --profile_dir {profiling_dir}")
+        print(f"{'='*80}\n")
+        
+        # Remove hooks
+        for hook in hooks:
+            hook.remove()
 
     # at this point if checkpoint_path does not exist, manually create one
     checkpoint_path = join(ckpt_callbacks[0].dirpath, "final.ckpt")

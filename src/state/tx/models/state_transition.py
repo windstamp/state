@@ -334,6 +334,8 @@ class StateTransitionPerturbationModel(PerturbationModel):
             self.gene_decoder = FinetuneVCICountsDecoder(
                 genes=gene_names,
             )
+        import sys
+        print(f"{__file__}:{sys._getframe().f_lineno}")
         print(self)
 
     def _build_networks(self, lora_cfg=None):
