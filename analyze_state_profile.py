@@ -9,7 +9,7 @@ Usage:
 
 import argparse
 import os
-from profile_utils import analyze_layer_shapes, analyze_chrome_trace, extract_operator_info, analyze_model_summary
+from profile_utils import analyze_layer_shapes, analyze_unique_operators, analyze_chrome_trace, extract_operator_info, analyze_model_summary
 
 
 def main():
@@ -47,6 +47,7 @@ def main():
     # Analyze layer shapes
     if os.path.exists(layer_shapes_file):
         analyze_layer_shapes(layer_shapes_file)
+        analyze_unique_operators(layer_shapes_file)
     else:
         print(f"Layer shapes file not found: {layer_shapes_file}")
     
